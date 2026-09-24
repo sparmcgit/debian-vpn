@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Mocks just enough of systemctl for setup_server()/do_disable()/do_enable()
+# and the watchdog's cancel path: for the wg-quick@<iface> unit specifically,
+# start/restart actually applies PostUp and stop actually applies PostDown
+# (via _apply.sh), mirroring what the real systemd unit would eventually do.
+# stop/reset-failed on a watchdog's transient unit unloads it for the mock
+# systemd-run. Everything else (enable/disable, other units) is a no-op.
+set -euo pipefail
+mydir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+echo "$*" >> "${WGFT_MOCK_STATE_DIR}/systemctl.log"
+
+sub=${1:-}
+unit=${2:-}
+
+apply_for_unit() {
+  local mode=$1
+  [[ "$unit" == wg-quick@* ]] || return 0
+  local iface="${unit#wg-quick@}"
+  local conf="$CONF_DIR/${iface}.conf"
+  local state_file="$WGFT_MOCK_STATE_DIR/${iface}.state"
+  if [[ "$mode" == up ]]; then
+    if [[ -f "$state_file" ]]; then
+      "$mydir/_apply.sh" "$conf" down
+    fi
+    "$mydir/_apply.sh" "$conf" up
+    touch "$state_file"
+  else
+    if [[ -f "$state_file" ]]; then
+      "$mydir/_apply.sh" "$conf" down
+      rm -f "$state_file"
+    fi
+  fi
+}
+
+# Unload a transient unit tracked by the mock systemd-run.
+unload_transient() {
+  local base="${unit%.timer}"; base="${base%.service}"
+  rm -f "${WGFT_MOCK_STATE_DIR}/transient-${base}"
+}
+
+case "$sub" in
+  restart|start) apply_for_unit up ;;
+  stop) [[ "$unit" == *.timer ]] && unload_transient; apply_for_unit down ;;
+  reset-failed) unload_transient ;;
+  *) : ;;
+esac
+exit 0

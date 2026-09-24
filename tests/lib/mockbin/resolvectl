@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# client_conf()'s PostUp already tolerates this failing (`|| true`); mocked
+# purely so a real resolvectl (if present) never tries to reach a real
+# systemd-resolved over D-Bus from inside the test's isolated namespace.
+exit 0

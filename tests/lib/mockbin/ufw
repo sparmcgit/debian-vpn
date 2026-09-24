@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# ensure_ufw_port() only calls `ufw status` (and `ufw allow <rule>` if
+# status says active). Mocked so tests never depend on - or noisily choke
+# on - this machine's real ufw installation/config: the real binary,
+# inside a user-namespace-only sandbox with no real root over host files,
+# produces harmless but very noisy UID-mismatch warnings when it tries to
+# read /etc/ufw/*.
+echo "$*" >> "${WGFT_MOCK_STATE_DIR}/ufw.log"
+case "${1:-}" in
+  status) echo "Status: inactive" ;;
+  *) : ;;
+esac
+exit 0

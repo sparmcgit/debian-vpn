@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Mocks just enough of wg-quick's contract for wg-fulltunnel.sh's own logic
+# to be tested: refusing "up" on an already-up interface (the exact bug
+# fixed in setup_client()), and actually running the real PostUp/PostDown
+# line from the conf so the generated nft/ip commands get verified for real.
+set -euo pipefail
+cmd=$1
+iface=$2
+mydir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+state_file="$WGFT_MOCK_STATE_DIR/${iface}.state"
+conf="$CONF_DIR/${iface}.conf"
+seq_log="$WGFT_MOCK_STATE_DIR/sequence.log"
+
+case "$cmd" in
+  up)
+    if [[ -f "$state_file" ]]; then
+      echo "wg-quick: \`${iface}' already exists" >&2
+      exit 1
+    fi
+    "$mydir/_apply.sh" "$conf" up
+    touch "$state_file"
+    echo "up $iface" >> "$seq_log"
+    ;;
+  down)
+    if [[ ! -f "$state_file" ]]; then
+      echo "wg-quick: \`${iface}' is not a WireGuard interface" >&2
+      exit 1
+    fi
+    "$mydir/_apply.sh" "$conf" down
+    rm -f "$state_file"
+    echo "down $iface" >> "$seq_log"
+    ;;
+  *)
+    echo "mock wg-quick: unsupported command '$cmd'" >&2
+    exit 1
+    ;;
+esac

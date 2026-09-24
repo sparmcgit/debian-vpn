@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# schedule_watchdog() mostly only needs this to succeed - the actual timer
+# firing is never exercised by the test suite (--revert-after 0, or
+# --confirm-revert/--rollback called directly, cover that instead). It does
+# track loaded unit names, though: real systemd-run refuses a --unit name
+# that's still loaded (an armed timer from a previous run, or a failed
+# service left behind after it fired), and a rerun hitting that is a real
+# bug this caught. The mock systemctl's "stop X.timer"/"reset-failed
+# X.service" unloads it again.
+echo "$*" >> "${WGFT_MOCK_STATE_DIR}/systemd-run.log"
+for arg in "$@"; do
+  case "$arg" in
+    --unit=*)
+      marker="${WGFT_MOCK_STATE_DIR}/transient-${arg#--unit=}"
+      if [[ -f "$marker" ]]; then
+        echo "Failed to start transient timer unit: Unit ${arg#--unit=}.timer was already loaded or has a fragment file." >&2
+        exit 1
+      fi
+      touch "$marker"
+      ;;
+  esac
+done
+exit 0

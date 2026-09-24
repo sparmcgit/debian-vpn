@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Mocks `wg genkey`, `wg pubkey`, and `wg show [iface [field]]` - the only
+# subcommands wg-fulltunnel.sh actually calls. Keys are placeholders; only
+# their presence/reuse matters to ensure_keys(), never their real validity.
+set -euo pipefail
+case "${1:-}" in
+  genkey)
+    echo "MOCKPRIVKEY-${RANDOM}-${RANDOM}="
+    ;;
+  pubkey)
+    cat >/dev/null
+    echo "MOCKPUBKEY-${RANDOM}-${RANDOM}="
+    ;;
+  show)
+    iface=${2:-}
+    # diagnose_client_failure() reads these; WGFT_MOCK_HANDSHAKE is an epoch
+    # timestamp (0 = never handshaked, like real wg).
+    case "${3:-}" in
+      latest-handshakes) printf 'PEERKEY\t%s\n' "${WGFT_MOCK_HANDSHAKE:-0}"; exit 0 ;;
+      transfer) printf 'PEERKEY\t0\t0\n'; exit 0 ;;
+    esac
+    if [[ -n "$iface" ]]; then
+      if [[ -f "${WGFT_MOCK_STATE_DIR}/${iface}.state" ]]; then
+        echo "interface: $iface"
+      else
+        echo "Unable to access interface $iface: No such device" >&2
+        exit 1
+      fi
+    fi
+    ;;
+  *)
+    exit 0
+    ;;
+esac

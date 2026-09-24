@@ -1,0 +1,309 @@
+debian-vpn architecture
+========================
+
+Everything below is implemented by ONE script, wg-fulltunnel.sh, copied to
+and run once on each of the two machines. There is no central orchestrator;
+each machine's role is chosen with --role server|client (or a standalone
+ACTION: keygen, rollback, confirm-revert, status, disable, enable).
+
+Firewall/NAT/mark rules are implemented with nftables (nft), not iptables.
+
+
+1. Network topology
+--------------------
+
+                 internet
+                     |
+                     |  UDP 51820 (WireGuard handshake/data)
+                     |
+   ,-----------------+-----------------,        ,--------------------------,
+   |   EXIT NODE ("server" role)       |        |  ORIGINAL UPSTREAM       |
+   |   e.g. a Debian box               |        |  (client's ISP/LAN       |
+   |                                   |        |  gateway, unchanged)     |
+   |  eth0 <public IP> <----------------------->|                          |
+   |  wg-debian-vpn 10.0.0.1/24         |        `--------------------------'
+   |                                   |                    ^
+   |  nft table inet wgft_server_...:  |                    | inbound SSH etc.
+   |   forward: iifname/oifname        |                    | to client's
+   |    wg-debian-vpn accept           |                    | ORIGINAL ip
+   |   postrouting: oifname eth0       |                    |
+   |    masquerade                     |                    |
+   |  ip_forward=1                     |                    |
+   `-----------------+-----------------'                    |
+                     | WireGuard tunnel                     |
+                     | (all client traffic, 0.0.0.0/0)      |
+                     v                                       |
+   ,-----------------+---------------------------------------+-----,
+   |   CLIENT ("client" role) - e.g. Kubuntu PC                    |
+   |                                                                |
+   |   eth0 <original LAN IP> <-----------------------------------'
+   |   wg-debian-vpn 10.0.0.2/24, default route (0.0.0.0/0)         |
+   |                                                                |
+   |   Two routing "planes" coexist via policy routing:            |
+   |                                                                |
+   |   PLANE A - locally-initiated outbound traffic                |
+   |     default route -> wg-debian-vpn -> exit node -> internet   |
+   |     (this is the new full-tunnel behaviour)                  |
+   |                                                                |
+   |   PLANE B - replies to inbound connections on eth0             |
+   |     nft table inet wgft_client_...:                           |
+   |       mangle_pre: iifname eth0 -> ct mark set 100              |
+   |       mangle_out: meta mark set ct mark  (restores it)         |
+   |     -> ip rule fwmark 100 table 100 (priority 100,             |
+   |        evaluated BEFORE 'main') -> table 100 has:              |
+   |          default via <original eth0 gateway>                  |
+   |          <eth0 connected subnet> dev eth0                     |
+   |     -> reply leaves via eth0, not wg-debian-vpn                |
+   |     (this is what keeps SSH/etc. to the ORIGINAL ip alive)    |
+   |                                                                |
+   |   DNS-leak kill switch (nft chain dns_out, hooked at output,  |
+   |   port 53):                                                    |
+   |     accept ip daddr <DNS server> udp/tcp dport 53  (added     |
+   |            FIRST - nft appends, so first-added = first-checked)|
+   |     reject oifname != wg-debian-vpn && ip daddr != 127.0.0.0/8 |
+   |            && meta mark != 100  udp/tcp dport 53  (added AFTER |
+   |            the accept, so it's only reached once the accept   |
+   |            exception has already had its chance to match)     |
+   |     (127.0.0.0/8 exempt so systemd-resolved's 127.0.0.53       |
+   |      stub, reached via lo, keeps working)                     |
+   `----------------------------------------------------------------'
+
+
+2. Why two planes are needed ("the routing loopback problem")
+---------------------------------------------------------------
+
+  Making wg-debian-vpn the default route (Plane A) means the kernel would,
+  by default, also route REPLIES to inbound connections (e.g. an SSH
+  session someone opened to the client's original IP) out through
+  wg-debian-vpn - breaking them, because that reply's source IP no longer
+  matches anything the remote peer expects and the return path is wrong.
+
+  Fix: mark inbound-originated connections (nft's ct mark, set in the
+  mangle_pre chain hooked at prerouting on eth0, restored onto the packet
+  mark in mangle_out hooked at output) and give marked packets their own
+  routing table (100) that still points at the ORIGINAL gateway/interface.
+  An ip rule with an explicit priority (100) makes that table get
+  consulted BEFORE the 'main' table for marked packets - without the
+  explicit priority the new rule can sort at or after 'main' (priority
+  32766), so 'main' (whose default route is now wg-debian-vpn too) wins
+  first and table 100 is silently never used.
+
+  Table 100 also needs the eth0 connected-subnet route, not just a
+  default route - otherwise a reply to a host on the SAME LAN segment as
+  the client gets sent indirectly via the gateway (table 100's lookup
+  already "succeeded" on the default route, so main's more specific
+  connected route is never reached), which can fail outright depending on
+  the router (no hairpinning).
+
+
+3. Client PostUp/PostDown symmetry -> rollback
+-----------------------------------------------
+
+  nft has no equivalent of iptables' -D ("delete by restating the exact
+  match spec"), so PostDown can't mirror PostUp rule-for-rule the way an
+  iptables-based version could. Instead:
+
+    ensure_nft_client_base() / ensure_nft_server_base() - called once
+      during setup, BEFORE PostUp ever runs - create the `inet` table and
+      its hooked chains (idempotent: adding an already-identical
+      table/chain is a no-op, not an error), then flush every chain empty
+      up front. This means a rerun, or a crash that skipped PostDown,
+      always starts from a clean chain.
+
+    client_conf()/server_conf() build the wg-quick PostUp block (ip
+    rule/route add, nft add rule ...) and an exactly mirrored PostDown
+    block (ip rule/route del, nft flush chain ...). Because PostDown
+    always undoes exactly what PostUp did (add vs. flush-empty, not
+    add-N-things vs. delete-those-same-N-things), do_rollback() can be
+    little more than `wg-quick down` - there is no separate "undo" logic
+    to keep in sync by hand. do_rollback() also deletes the nft table
+    entirely, matching how it removes the sysctl file setup created.
+
+  wg-quick itself has no "reconfigure in place" - `wg-quick up` refuses if
+  the interface already exists. setup_client() checks `wg show $IFACE`
+  and runs `wg-quick down $IFACE` first if so, and does this BEFORE
+  write_file() overwrites $conf - so the teardown still runs the
+  currently-loaded PostDown (matching whatever's actually applied), not a
+  freshly-regenerated one that might disagree with it if a value like
+  --mgmt-iface changed between runs. setup_server() doesn't need this: a
+  systemd unit can be `systemctl restart`ed in place.
+
+  Safety net around all of this (client only):
+    schedule_watchdog()  - before `wg-quick up` even runs, an auto-rollback
+                            is scheduled (systemd-run, falling back to
+                            `at`, then a detached `nohup sleep`) for
+                            --revert-after minutes.
+    wg-quick up wg-debian-vpn
+    validate_client()    - curl -4 (forced, to dodge a dead ::/0 route
+                            wg-quick adds regardless of real IPv6 support)
+                            + `ip route get 1.1.1.1 mark 100` (must show
+                            the ORIGINAL device, not wg-debian-vpn - proves
+                            Plane B is actually consulted, not just that
+                            table 100 "looks" correct).
+    --confirm-revert      - run from a FRESH connection to prove the box
+      or (--yes + validate_client() success)
+                            is still reachable -> cancel_watchdog().
+    (else)                - watchdog fires -> do_rollback() -> box self-
+                            heals even if the script crashed mid-way.
+
+
+4. Script control flow (wg-fulltunnel.sh)
+--------------------------------------------
+
+  argv
+   |
+   +-- prescan_config() --> parse_config_file() --> synthetic --flag args
+   |        (pulls --config FILE out of argv wherever it appears,       )
+   |        (BOOL_FLAGS decides =true vs value-taking keys              )
+   |        prepended to real argv, so explicit CLI flags still win
+   |
+   v
+  parse_args() --> main() dispatches on --role / ACTION:
+
+    --keygen              -> do_keygen()        ensure_keys() + print pubkey
+                             (no role-specific requirements; exempt from
+                              --peer-pubkey etc. so it can run first)
+
+    --role server          -> setup_server()
+                               ensure_keys() -> mkdir_conf_dir() ->
+                               ensure_nft_server_base() ->
+                               server_conf() -> write_file()/backup_file() ->
+                               write_sysctl() (ip_forward) ->
+                               ensure_ufw_port() -> systemctl restart
+
+    --role client           -> setup_client()
+                               ensure_keys() -> detect_default_route() +
+                               detect_mgmt_subnet() ->
+                               ensure_nft_client_base() ->
+                               (if already up: wg-quick down first) ->
+                               client_conf() -> write_file()/backup_file() ->
+                               schedule_watchdog() -> run("wg-quick up") ->
+                               validate_client() -> cancel_watchdog() (on
+                               success + --yes) or leave watchdog armed
+
+    --rollback              -> do_rollback()       wg-quick down + nft
+                               table delete + cleanup
+    --confirm-revert        -> do_confirm_revert()  cancel_watchdog()
+    --status                -> do_status()          wg/ip rule/nft dump
+    --disable / --enable    -> do_disable()/do_enable()  plain stop/start
+                               toggle, no watchdog, no re-validation
+    --config-example         -> print_config_example()  must stay parseable
+                               by parse_config_file() - checked by
+                               tests/unit/test_config_example_roundtrip.sh
+
+  Cross-cutting:
+    run()          - every mutating shell command goes through this so
+                     --dry-run can intercept it uniformly.
+    write_file()/backup_file() - file writes go through these instead of
+                     run(); any file about to be overwritten is copied to
+                     *.conf.bak.<timestamp> first.
+    --dry-run       - still requires root: it reads live routing/firewall
+                     state (ip rule, ip route, nft) to report accurately,
+                     even though it changes nothing.
+
+
+5. IPv6 (optional, --ipv6)
+----------------------------
+  ip rule/ip route are genuinely separate v4/v6 kernel stacks, so the
+  policy-routing half (Plane B) is still mirrored with `ip -6` commands
+  when --ipv6 is given.
+
+  The firewall/mark half is NOT duplicated, though: since the nft tables
+  are `inet` (not separate `ip`/`ip6` tables like iptables/ip6tables were),
+  their rules already match both IPv4 and IPv6 packets by default - the
+  server's forward/masquerade rules and the client's ct-mark rules need
+  no IPv6-specific copy.
+
+  Default posture without --ipv6 is to leave IPv6 disabled
+  (net.ipv6.conf.*.disable_ipv6=1) so there's no stack left to leak around
+  the tunnel.
+
+
+6. Test suite (tests/, run via tests/run.sh)
+-----------------------------------------------
+
+  tests/unit/*.sh        - source wg-fulltunnel.sh's functions directly
+                            (main() stripped out) and assert on the
+                            generated strings: nft rule ordering (accept
+                            exceptions before the catch-all reject in
+                            dns_out), no leftover iptables/ip6tables text,
+                            mark/table substitution, etc. No root needed.
+
+  tests/unit/test_bool_flags_sync.sh - parses parse_args()'s own case
+                            statements (which cases "shift 2" vs bare
+                            "shift") and cross-checks against BOOL_FLAGS,
+                            i.e. it automates the exact invariant called
+                            out where new flags get added.
+
+  tests/unit/test_config_example_roundtrip.sh - runs print_config_example()
+                            through parse_config_file() for real, instead
+                            of "regenerate and eyeball it".
+
+  tests/integration/*.sh - run the REAL wg-fulltunnel.sh end-to-end,
+                            inside its own throwaway sandbox:
+
+      unshare --user --map-root-user --net   (per test file, via run.sh)
+             |
+             +-- gives real root (satisfies require_root()) and a fresh,
+             |   isolated network stack - safe for real `nft`/`ip`
+             |   mutations, all of which vanish when the process exits.
+             |
+             +-- setup_sandbox() (tests/lib/integration_helpers.sh):
+                   - points CONF_DIR/LOG_FILE/WATCHDOG_STATE_DIR/
+                     LOCK_FILE/SYSCTL_DIR at a scratch dir, via the
+                     ": ${VAR:=default}" overrides added to the script
+                     for exactly this purpose (real invocations unaffected)
+                   - PATH := <mockbin>:/usr/sbin:/usr/bin:/sbin:/bin
+                     (curated, not prepended - a real system copy of
+                     wg/wg-quick/curl elsewhere can never leak in)
+                   - creates a dummy "wgft-mgmt0" interface, so the
+                     client's real `ip route add ... dev $MGMT_IFACE`
+                     commands have something real to attach to
+
+  mockbin/ - wg, wg-quick, systemctl, systemd-run, sysctl, curl,
+  resolvectl are mocked (no real WireGuard peer or systemd instance to
+  talk to). ufw is mocked for a different reason: the real binary, if
+  actually installed on whatever machine runs the tests, tries to read
+  /etc/ufw/* as "root" - but unshare --map-root-user only maps ONE uid to
+  0, so real-root-owned host files have no mapping and show up owned by
+  the overflow uid, which ufw's own sanity checks complain loudly about
+  (harmless - ensure_ufw_port() falls back to "inactive" either way - but
+  noisy enough to look broken when it isn't). nft and ip are NOT mocked -
+  they're the real binaries, because verifying their real resulting state
+  is the whole point.
+  The mock wg-quick/systemctl shims actually extract and execute the
+  single real PostUp/PostDown line from the generated conf (via
+  mockbin/_apply.sh) before flipping their own up/down state marker, so
+  the real nft tables and ip rules/routes this produces get asserted on
+  for real - not just the string that would have generated them.
+
+  This is what lets the suite regression-test the exact bugs hit in the
+  field: rerunning client setup while the interface is already "up" (mock
+  wg-quick refuses "up" on a marker file that's already there, exactly
+  like the real one refusing on an existing device) exercises the same
+  "bring it down first" fix in setup_client() for real, and a forced
+  curl failure exercises the actual do_rollback() cleanup (nft table
+  deleted, conf restored) rather than just reading the code and assuming
+  it works.
+
+  Portability: run.sh probes both environment dependencies before
+  attempting the integration tier, and skips it (message, not a failure -
+  unit tests still run) if either is missing: unprivileged user
+  namespaces (some hardened kernels/AppArmor profiles restrict these), or
+  `nft` itself (deliberately unmocked). The nft probe checks
+  /usr/sbin:/usr/bin:/sbin:/bin directly rather than trusting the
+  caller's inherited $PATH - /usr/sbin commonly isn't on a normal user's
+  PATH even when nft is sitting right there, which produced a real
+  false-skip the first time this was written.
+
+  Confirmed field cause of the userns skip: AppArmor's
+  "unprivileged_userns" profile denying `unshare` the sys_admin
+  capability - shows up in dmesg/journalctl -k as:
+    apparmor="DENIED" operation="capable" profile="unprivileged_userns"
+    comm="unshare" capability=21 capname="sys_admin"
+  This is Ubuntu's kernel.apparmor_restrict_unprivileged_userns hardening
+  (newer default), not a misconfiguration - don't disable it on a given
+  box just to unlock integration coverage there. Treat the integration
+  tier as best-effort per-machine; the unit tests (no root, no
+  namespaces) always run and cover the generated nft/config logic on
+  their own regardless of this.

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# write_sysctl()/write_sysctl_disable_ipv6() call "sysctl --system" to
+# apply the file they just wrote - not meaningful inside an isolated test
+# netns, so just record that it was invoked.
+echo "$*" >> "${WGFT_MOCK_STATE_DIR}/sysctl.log"
+exit 0

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# validate_client()'s outbound-connectivity check. Controlled entirely by
+# WGFT_MOCK_CURL_RESULT so tests can deterministically exercise both the
+# "validation passes" and "validation fails -> rollback" paths without any
+# real network access. diagnose_client_failure()'s raw-IP probe
+# (https://1.1.1.1) can be steered separately via WGFT_MOCK_CURL_IP_RESULT.
+for arg in "$@"; do
+  [[ "$arg" == https://1.1.1.1 ]] && exit "${WGFT_MOCK_CURL_IP_RESULT:-${WGFT_MOCK_CURL_RESULT:-0}}"
+done
+exit "${WGFT_MOCK_CURL_RESULT:-0}"
